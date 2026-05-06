@@ -13,4 +13,5 @@ build:
 
 upload:
 	@[ -n "$(PORT)" ] || (echo "FAIL: no board detected. Connect the ESP32 and retry."; exit 1)
-	arduino-cli upload -p $(PORT) --fqbn $(BOARD) "$(SKETCH_DIR)"
+	arduino-cli upload -p $(PORT) --fqbn $(BOARD) "$(SKETCH_DIR)" --upload-property upload.speed=115200 || \
+		(echo "FAIL: Upload failed. Try manually grounding GPIO0 to GND to reset the chip into download mode."; exit 1)
