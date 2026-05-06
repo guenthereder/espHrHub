@@ -1,95 +1,431 @@
+/*
+ * espHrHub.ino - BLE Heart Rate Hub
+ * 
+ * Central device that connects to HR sensors (UUID 180D) and forwards
+ * heart rate data to Apple Watch via BLE server advertising.
+ */
+
 #include <NimBLEDevice.h>
+#include "config.h"
 
-// ── Peripheral side (toward Apple Watch) ──────────────────────────────────
-NimBLECharacteristic* pHRChar;
-bool watchConnected = false;
+// ── Global State ───────────────────────────────────────────────────────────
+NimBLEServer* pPeripheralServer = nullptr;
+NimBLEAdvertising* pPeripheralAdvertising = nullptr;
+NimBLECharacteristic* pHRSensorCharacteristic = nullptr;
 
-// ── Central side (toward real HR sensors) ────────────────────────────────
-NimBLEClient* pClient = nullptr;
-uint8_t lastBPM = 70; // fallback during sensor switch
-
-// Addresses of your two sensors (find via BLE scan)
-const char* SENSOR_A = "AA:BB:CC:DD:EE:FF";
-const char* SENSOR_B = "11:22:33:44:55:66";
-const char* activeSensor = SENSOR_A;
-
-// ── Peripheral callbacks ──────────────────────────────────────────────────
-class ServerCB : public NimBLEServerCallbacks {
-  void onConnect(NimBLEServer* s)    { watchConnected = true; }
-  void onDisconnect(NimBLEServer* s) {
-    watchConnected = false;
-    NimBLEDevice::startAdvertising();
-  }
+// Sensor slots
+struct SensorSlot {
+  uint8_t macAddress[6];
+  uint8_t lastBPM;
+  unsigned long lastTimestamp;
+  bool isConnected;
+  NimBLEClient* client;
+  NimBLERemoteCharacteristic* hrCharacteristic;
 };
 
-// ── HR notification from real sensor → forward to watch ──────────────────
-void hrNotifyCallback(NimBLERemoteCharacteristic* c, uint8_t* data, size_t len, bool isNotify) {
-  lastBPM = data[1]; // assumes uint8 BPM format (flags byte = 0x00)
-  if (watchConnected) {
-    pHRChar->setValue(data, len); // forward raw packet as-is
-    pHRChar->notify();
+static SensorSlot sensorSlots[MAX_SENSOR_SLOTS];
+
+// Current state
+int activeSensorIndex = -1;
+uint8_t lastBPMFromAnySensor = 70;
+bool watchConnected = false;
+int ledMode = LED_MODE_OFF;
+
+// Reconnection tracking
+unsigned long lastReconnectAttempt[MAX_SENSOR_SLOTS] = {0};
+unsigned long reconnectDelayMs[MAX_SENSOR_SLOTS] = {1000, 1000, 1000, 1000};
+
+// ── Helper Functions ───────────────────────────────────────────────────────
+bool macEquals(const uint8_t* a, const uint8_t* b) {
+  for (int i = 0; i < 6; i++) {
+    if (a[i] != b[i]) return false;
   }
-}
-
-// ── Connect to a sensor by address ───────────────────────────────────────
-bool connectToSensor(const char* address) {
-  if (pClient && pClient->isConnected()) pClient->disconnect();
-
-  pClient = NimBLEDevice::createClient();
-  NimBLEAddress addr(std::string(address), BLE_ADDR_PUBLIC);
-
-  if (!pClient->connect(addr)) return false;
-
-  NimBLERemoteService* svc = pClient->getService("180D");
-  if (!svc) { pClient->disconnect(); return false; }
-
-  NimBLERemoteCharacteristic* chr = svc->getCharacteristic("2A37");
-  if (!chr || !chr->canNotify()) { pClient->disconnect(); return false; }
-
-  chr->subscribe(true, hrNotifyCallback);
   return true;
 }
 
-// ── Switch active sensor (call this whenever you want to swap) ────────────
-void switchSensor(const char* newSensor) {
-  activeSensor = newSensor;
-  connectToSensor(newSensor); // watch side keeps running, no blip visible
+bool macIsUnused(const uint8_t* mac) {
+  for (int i = 0; i < 6; i++) {
+    if (mac[i] != 0) return false;
+  }
+  return true;
 }
 
-// ── Setup ─────────────────────────────────────────────────────────────────
+bool macIsConnected(int slotIndex) {
+  if (slotIndex < 0 || slotIndex >= MAX_SENSOR_SLOTS) return false;
+  return sensorSlots[slotIndex].isConnected && 
+         sensorSlots[slotIndex].client != nullptr &&
+         sensorSlots[slotIndex].client->isConnected();
+}
+
+// ── BLE Callback Classes ───────────────────────────────────────────────────
+class ServerCallbacks : public NimBLEServerCallbacks {
+  void onConnect(NimBLEServer* server, NimBLEConnInfo& connInfo) {
+    watchConnected = true;
+  }
+  
+  void onDisconnect(NimBLEServer* server) {
+    watchConnected = false;
+    pPeripheralAdvertising->start();
+  }
+};
+
+class ScanCallbacks : public NimBLEScanCallbacks {
+public:
+  static int discoveredCount;
+  
+  void onResult(const NimBLEAdvertisedDevice* advertisedDevice) override {
+    NimBLEUUID uuid("180D");
+    if (advertisedDevice->haveServiceData() ||
+        advertisedDevice->getServiceUUID().equals(uuid)) {
+      discoveredCount++;
+    }
+  }
+};
+
+int ScanCallbacks::discoveredCount = 0;
+
+void hrNotificationCallback(NimBLERemoteCharacteristic* characteristic, 
+                            uint8_t* data, size_t len, bool isNotify) {
+  lastBPMFromAnySensor = data[1];
+  if (watchConnected && pHRSensorCharacteristic != nullptr) {
+    pHRSensorCharacteristic->setValue(data, len);
+    pHRSensorCharacteristic->notify();
+  }
+};
+
+// ── Sensor Connection Functions ─────────────────────────────────────────────
+bool connectToSensor(int slotIndex) {
+  if (slotIndex < 0 || slotIndex >= MAX_SENSOR_SLOTS) return false;
+  if (macIsUnused(sensorSlots[slotIndex].macAddress)) {
+    Serial.print("Cannot connect: empty MAC at slot ");
+    Serial.println(slotIndex);
+    return false;
+  }
+  
+  SensorSlot* slot = &sensorSlots[slotIndex];
+  
+  if (slot->client != nullptr) {
+    if (slot->isConnected && slot->client->isConnected()) {
+      slot->client->disconnect();
+    }
+    NimBLEDevice::deleteClient(slot->client);
+    slot->client = nullptr;
+  }
+  
+  NimBLEAddress address(slot->macAddress, BLE_ADDR_PUBLIC);
+  slot->client = NimBLEDevice::createClient();
+  
+  Serial.print("Connecting to sensor at slot ");
+  Serial.print(slotIndex);
+  Serial.print("...");
+  
+  if (!slot->client->connect(address)) {
+    Serial.println(" FAILED");
+    NimBLEDevice::deleteClient(slot->client);
+    slot->client = nullptr;
+    return false;
+  }
+  
+  Serial.println(" OK");
+  
+  NimBLERemoteService* svc = slot->client->getService("180D");
+  if (!svc) {
+    Serial.println("  Service 180D not found, disconnecting");
+    slot->client->disconnect();
+    return false;
+  }
+  
+  NimBLERemoteCharacteristic* chr = svc->getCharacteristic("2A37");
+  if (!chr || !chr->canNotify()) {
+    Serial.println("  Characteristic 2A37 not found or no notify, disconnecting");
+    slot->client->disconnect();
+    return false;
+  }
+  
+  chr->subscribe(true, hrNotificationCallback);
+  slot->hrCharacteristic = chr;
+  slot->isConnected = true;
+  
+  Serial.println("  Subscribed to HR notifications");
+  
+  reconnectDelayMs[slotIndex] = 1000;
+  
+  return true;
+}
+
+bool disconnectSensor(int slotIndex) {
+  if (slotIndex < 0 || slotIndex >= MAX_SENSOR_SLOTS) return false;
+  
+  SensorSlot* slot = &sensorSlots[slotIndex];
+  if (slot->client != nullptr && slot->isConnected) {
+    slot->client->disconnect();
+  }
+  
+  return true;
+}
+
+void switchActiveSensor(int newSlotIndex) {
+  if (newSlotIndex < 0 || newSlotIndex >= MAX_SENSOR_SLOTS) {
+    Serial.println("Invalid slot index");
+    return;
+  }
+  
+  if (macIsUnused(sensorSlots[newSlotIndex].macAddress)) {
+    Serial.print("No sensor stored in slot ");
+    Serial.println(newSlotIndex);
+    return;
+  }
+  
+  if (activeSensorIndex != -1 && activeSensorIndex != newSlotIndex) {
+    disconnectSensor(activeSensorIndex);
+  }
+  
+  if (connectToSensor(newSlotIndex)) {
+    activeSensorIndex = newSlotIndex;
+    Serial.print("Switched to sensor at slot ");
+    Serial.println(activeSensorIndex);
+  } else {
+    Serial.print("Failed to connect to sensor at slot ");
+    Serial.println(newSlotIndex);
+  }
+}
+
+// ── LED Management ────────────────────────────────────────────────────────
+void updateLED() {
+  static unsigned long lastLedToggle = 0;
+  static bool ledState = false;
+  
+  switch (ledMode) {
+    case LED_MODE_OFF:
+      digitalWrite(LED_PIN, LOW);
+      break;
+      
+    case LED_MODE_SCANNING:
+      if (millis() - lastLedToggle >= 250) {
+        ledState = !ledState;
+        digitalWrite(LED_PIN, ledState ? HIGH : LOW);
+        lastLedToggle = millis();
+      }
+      break;
+      
+    case LED_MODE_CONNECTING:
+      if (millis() - lastLedToggle >= 50) {
+        ledState = !ledState;
+        digitalWrite(LED_PIN, ledState ? HIGH : LOW);
+        lastLedToggle = millis();
+      }
+      break;
+      
+    case LED_MODE_CONNECTED:
+      digitalWrite(LED_PIN, HIGH);
+      break;
+  }
+}
+
+// ── Button Handling ───────────────────────────────────────────────────────
+void IRAM_ATTR handleButtonInterrupt() {
+  static unsigned long lastInterruptTime = 0;
+  unsigned long interruptTime = millis();
+  
+  if (interruptTime - lastInterruptTime > 200) {
+    Serial.println("Button pressed - initiating scan...");
+  }
+  lastInterruptTime = interruptTime;
+}
+
+void handleSerialInput() {
+  while (Serial.available()) {
+    char cmd = Serial.read();
+    
+    if (cmd == COMMAND_SCAN || cmd == 's' || cmd == 'S') {
+      Serial.println("Scanning for HR sensors...");
+      scanForSensors();
+    }
+    else if (cmd == COMMAND_SELECT_1 || cmd == '1') {
+      switchActiveSensor(0);
+    }
+    else if (cmd == COMMAND_SELECT_2 || cmd == '2') {
+      switchActiveSensor(1);
+    }
+    else if (cmd == COMMAND_SELECT_3 || cmd == '3') {
+      switchActiveSensor(2);
+    }
+    else if (cmd == COMMAND_SELECT_4 || cmd == '4') {
+      switchActiveSensor(3);
+    }
+    else if (cmd == COMMAND_HELP || cmd == '?') {
+      Serial.println(F("===espHrHub Help==="));
+      Serial.println(F("S/s - Scan for sensors"));
+      Serial.println(F("1-4 - Select sensor slot 1-4"));
+      Serial.println(F("?   - Show this help"));
+    }
+    else {
+      Serial.print("Unknown command: ");
+      Serial.println(cmd);
+    }
+  }
+}
+
+// ── Reconnection Logic ─────────────────────────────────────────────────────
+void checkSensorReconnections() {
+  for (int i = 0; i < MAX_SENSOR_SLOTS; i++) {
+    if (!macIsUnused(sensorSlots[i].macAddress) && !macIsConnected(i)) {
+      unsigned long now = millis();
+      
+      if (now - lastReconnectAttempt[i] >= reconnectDelayMs[i]) {
+        Serial.print("Attempting to reconnect to slot ");
+        Serial.println(i);
+        
+        if (connectToSensor(i)) {
+          if (activeSensorIndex == i) {
+            Serial.println("Reconnect successful - sensor is now active");
+          }
+        } else {
+          reconnectDelayMs[i] *= 2;
+          if (reconnectDelayMs[i] > MAX_RECONNECT_DELAY_MS) {
+            reconnectDelayMs[i] = MAX_RECONNECT_DELAY_MS;
+          }
+        }
+        
+        lastReconnectAttempt[i] = now;
+      }
+    }
+  }
+}
+
+// ── BLE Setup Functions ────────────────────────────────────────────────────
+void setupBLE() {
+  NimBLEDevice::init("ESP32 HR Hub");
+  
+  pPeripheralServer = NimBLEDevice::createServer();
+  pPeripheralServer->setCallbacks(new ServerCallbacks());
+  
+  NimBLEService* hrService = pPeripheralServer->createService("180D");
+  pHRSensorCharacteristic = hrService->createCharacteristic(
+    "2A37", 
+    NIMBLE_PROPERTY::NOTIFY
+  );
+  hrService->start();
+  
+  pPeripheralAdvertising = NimBLEDevice::getAdvertising();
+}
+
+void startAdvertising() {
+  if (pPeripheralAdvertising) {
+    pPeripheralAdvertising->addServiceUUID("180D");
+    pPeripheralAdvertising->start();
+  }
+}
+
+void scanForSensors() {
+  if (pPeripheralAdvertising) {
+    pPeripheralAdvertising->stop();
+  }
+  
+  Serial.println("Scanning for HR sensors (180D)...");
+  
+  NimBLEScan* pScan = NimBLEDevice::getScan();
+  ScanCallbacks scanCallbacks;
+  pScan->setScanCallbacks(&scanCallbacks);
+  pScan->start(SCAN_DURATION_MS / 1000.0, false);
+  
+  Serial.println("Scan complete.");
+  Serial.print("Found ");
+  int count = ScanCallbacks::discoveredCount;
+  Serial.print(count);
+  Serial.println(" devices with HR service.");
+  
+  ScanCallbacks::discoveredCount = 0;
+  
+  for (int i = 0; i < MAX_SENSOR_SLOTS; i++) {
+    if (!macIsUnused(sensorSlots[i].macAddress)) {
+      Serial.print(" Slot ");
+      Serial.print(i);
+      Serial.print(": ");
+      for (int j = 0; j < 6; j++) {
+        Serial.print(sensorSlots[i].macAddress[j], HEX);
+        if (j < 5) Serial.print(":");
+      }
+      
+      if (!macIsConnected(i) && reconnectDelayMs[i] == 1000) {
+        Serial.print(" [connecting]");
+        connectToSensor(i);
+      }
+      Serial.println();
+    }
+  }
+  
+  startAdvertising();
+}
+
+// ── Setup Function ─────────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
-  NimBLEDevice::init("ESP32 HRM");
-
-  // Peripheral side
-  NimBLEServer* pServer = NimBLEDevice::createServer();
-  pServer->setCallbacks(new ServerCB());
-
-  NimBLEService* pHRSvc = pServer->createService("180D");
-  pHRChar = pHRSvc->createCharacteristic("2A37", NIMBLE_PROPERTY::NOTIFY);
-  pHRSvc->start();
-
-  NimBLEAdvertising* pAdv = NimBLEDevice::getAdvertising();
-  pAdv->addServiceUUID("180D");
-  pAdv->start();
-
-  // Connect to first sensor
-  connectToSensor(SENSOR_A);
+  while (!Serial) delay(100);
+  
+  Serial.println(F("\n=== espHrHub Starting ==="));
+  
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), handleButtonInterrupt, FALLING);
+  
+  pinMode(LED_PIN, OUTPUT);
+  ledMode = LED_MODE_OFF;
+  
+  for (int i = 0; i < MAX_SENSOR_SLOTS; i++) {
+    sensorSlots[i].client = nullptr;
+    sensorSlots[i].hrCharacteristic = nullptr;
+    sensorSlots[i].isConnected = false;
+    sensorSlots[i].lastBPM = 70;
+    
+    memcpy(sensorSlots[i].macAddress, DISCOVERED_MAC_ADDRESSES[i], 6);
+    
+    if (!macIsUnused(sensorSlots[i].macAddress)) {
+      Serial.print("Configured sensor slot ");
+      Serial.print(i);
+      Serial.print(": ");
+      for (int j = 0; j < 6; j++) {
+        Serial.print(sensorSlots[i].macAddress[j], HEX);
+        if (j < 5) Serial.print(":");
+      }
+      Serial.println();
+    }
+  }
+  
+  setupBLE();
+  startAdvertising();
+  
+  Serial.println(F("\nConnecting to configured sensors..."));
+  bool connectedAny = false;
+  for (int i = 0; i < MAX_SENSOR_SLOTS; i++) {
+    if (!macIsUnused(sensorSlots[i].macAddress)) {
+      if (connectToSensor(i)) {
+        connectedAny = true;
+        if (activeSensorIndex == -1) {
+          activeSensorIndex = i;
+        }
+      }
+    }
+  }
+  
+  if (!connectedAny) {
+    Serial.println(F("No sensors configured or available. Press button to scan."));
+  } else {
+    Serial.print(F("Active sensor: slot "));
+    Serial.println(activeSensorIndex);
+  }
+  
+  if (activeSensorIndex != -1 && macIsConnected(activeSensorIndex)) {
+    ledMode = LED_MODE_CONNECTED;
+  }
+  
+  Serial.println(F("\n=== Setup Complete ==="));
 }
 
-// ── Loop: keep sensor connection alive, handle switch trigger ─────────────
+// ── Main Loop ──────────────────────────────────────────────────────────────
 void loop() {
-  // If sensor dropped, reconnect
-  if (pClient && !pClient->isConnected()) {
-    connectToSensor(activeSensor);
-  }
-
-  // Example: switch trigger via Serial (send 'A' or 'B')
-  if (Serial.available()) {
-    char cmd = Serial.read();
-    if (cmd == 'A') switchSensor(SENSOR_A);
-    if (cmd == 'B') switchSensor(SENSOR_B);
-  }
-
-  delay(100);
+  handleSerialInput();
+  checkSensorReconnections();
+  updateLED();
+  
+  delay(50);
 }

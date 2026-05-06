@@ -2,7 +2,7 @@
 
 BOARD        ?= esp32:esp32:esp32
 SKETCH_DIR   ?= $(CURDIR)
-PORT         ?= $(shell arduino-cli board list 2>/dev/null | awk 'NR>1 && $$1!="" {print $$1; exit}')
+PORT         ?= $(shell arduino-cli board list 2>/dev/null | awk 'NR>1 && $$1!="" && $$5~/USB/ {print $$1; exit}')
 
 verify: build
 
