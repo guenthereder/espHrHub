@@ -36,7 +36,7 @@ bool connectToSensor(const char* address) {
   if (pClient && pClient->isConnected()) pClient->disconnect();
 
   pClient = NimBLEDevice::createClient();
-  NimBLEAddress addr(address);
+  NimBLEAddress addr(std::string(address), BLE_ADDR_PUBLIC);
 
   if (!pClient->connect(addr)) return false;
 
