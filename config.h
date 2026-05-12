@@ -18,7 +18,7 @@
  * -----------------
  * Settings for Bluetooth Low Energy scanning and connection.
  */
-#define MAX_SENSOR_SLOTS 4           // Maximum number of sensor slots to support
+#define MAX_SENSOR_SLOTS 10            // Maximum number of sensor slots to support
 #define SCAN_DURATION_MS 5000        // Duration to scan for sensors in milliseconds
 #define MAX_RECONNECT_DELAY_MS 30000 // Maximum delay between reconnection attempts
 

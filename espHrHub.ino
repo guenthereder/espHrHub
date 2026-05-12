@@ -91,17 +91,39 @@ public:
   ScanCallbacks() : devices(discoveredDevices) {}
   
   void onResult(const NimBLEAdvertisedDevice* advertisedDevice) override {
-    NimBLEUUID uuid("180D");
-    if (advertisedDevice->haveServiceData() ||
-        advertisedDevice->getServiceUUID().equals(uuid)) {
-      if (discoveredDeviceCount < MAX_SENSOR_SLOTS) {
+    if (discoveredDeviceCount < MAX_SENSOR_SLOTS) {
         devices[discoveredDeviceCount].name = advertisedDevice->getName().c_str();
         devices[discoveredDeviceCount].address = advertisedDevice->getAddress();
         devices[discoveredDeviceCount].rssi = advertisedDevice->getRSSI();
-        }
-      discoveredDeviceCount++;
-      }
     }
+    // Print every device we find
+    Serial.print(F("   [" ));
+    Serial.print(discoveredDeviceCount);
+    Serial.print(F("] " ));
+    if (advertisedDevice->haveName()) {
+        Serial.print(advertisedDevice->getName().c_str());
+    } else {
+        Serial.print(F("(no name)"));
+    }
+    Serial.print(F("  MAC: " ));
+    const uint8_t* m = advertisedDevice->getAddress().getVal();
+    for (int j = 0; j < 6; j++) {
+        if (m[j] < 0x10) Serial.print('0');
+        Serial.print(m[j], HEX);
+        if (j < 5) Serial.print(':');
+    }
+    Serial.print(F("  RSSI: " ));
+    Serial.print(advertisedDevice->getRSSI());
+    if (advertisedDevice->haveServiceUUID()) {
+        Serial.print(F("  UUID: " ));
+        Serial.print(advertisedDevice->getServiceUUID().toString().c_str());
+    }
+    if (advertisedDevice->haveServiceData()) {
+        Serial.print(F("  [has service data]"));
+    }
+    Serial.println();
+    discoveredDeviceCount++;
+}
 };
 
 // File-global — lives for the entire program lifetime so NimBLE's raw pointer
@@ -247,16 +269,6 @@ void updateLED() {
 }
 
 // ── Button Handling ───────────────────────────────────────────────────────
-void IRAM_ATTR handleButtonInterrupt() {
-  static unsigned long lastInterruptTime = 0;
-  unsigned long interruptTime = millis();
-  
-  if (interruptTime - lastInterruptTime > 200) {
-    buttonScanRequested = true;
-   }
-  lastInterruptTime = interruptTime;
-}
-
 void handleSerialInput() {
   while (Serial.available()) {
     char cmd = Serial.read();
@@ -319,7 +331,7 @@ void checkSensorReconnections() {
 
 // ── BLE Setup Functions ────────────────────────────────────────────────────
 void setupBLE() {
-  NimBLEDevice::init("ESP32 HR Hub");
+   NimBLEDevice::init("espHRhub");
   
   pPeripheralServer = NimBLEDevice::createServer();
   pPeripheralServer->setCallbacks(new ServerCallbacks());
@@ -347,43 +359,50 @@ void startAdvertising() {
     pPeripheralAdvertising->setAppearance(0x0340);         // Heart Rate Sensor
     pPeripheralAdvertising->setName("espHRhub");
     pPeripheralAdvertising->enableScanResponse(true);
+    pPeripheralAdvertising->setMinInterval(32);
+    pPeripheralAdvertising->setMaxInterval(80);
     pPeripheralAdvertising->start();
     Serial.println(F("BLE advertising started as 'espHRhub' (HR sensor)"));
   }
 }
 
 void scanForSensors() {
-  // Reset discovered devices array
+   // Reset discovered devices array
    for (int i = 0; i < MAX_SENSOR_SLOTS; i++) {
-    discoveredDevices[i].name = "";
-    discoveredDevices[i].address = NimBLEAddress((uint8_t[]){0,0,0,0,0,0}, BLE_ADDR_PUBLIC);
-    discoveredDevices[i].rssi = 0;
+     discoveredDevices[i].name = "";
+     discoveredDevices[i].address = NimBLEAddress((uint8_t[]){0,0,0,0,0,0}, BLE_ADDR_PUBLIC);
+     discoveredDevices[i].rssi = 0;
    }
+   
+    Serial.println("Scanning for nearby BLE devices...");
+    Serial.print("Scan duration: ");
+    Serial.print(SCAN_DURATION_MS);
+    Serial.println(" ms");
+    Serial.print("Max sensor slots: ");
+    Serial.println(MAX_SENSOR_SLOTS);
   
-  if (pPeripheralAdvertising) {
-    pPeripheralAdvertising->stop();
-   }
+    // Must stop advertising to scan — single BLE radio can't do both
+    if (pPeripheralAdvertising) {
+        pPeripheralAdvertising->stop();
+        delay(100);   // Let advertising fully stop
+    }
   
-   Serial.println("Scanning for HR sensors (UUID 180D)...");
-   Serial.print("Scan duration: ");
-   Serial.print(SCAN_DURATION_MS);
-   Serial.println(" ms");
-   Serial.print("Max sensor slots: ");
-   Serial.println(MAX_SENSOR_SLOTS);
+    NimBLEScan* pScan = NimBLEDevice::getScan();
+    pScan->setScanCallbacks(&scanCallbacks);
+    pScan->start(SCAN_DURATION_MS / 1000.0, false);
   
-  NimBLEScan* pScan = NimBLEDevice::getScan();
-  pScan->setScanCallbacks(&scanCallbacks);
-  pScan->start(SCAN_DURATION_MS / 1000.0, false);
+   Serial.println("Scan complete.");
+   Serial.print("Found ");
+   int count = discoveredDeviceCount;
+   Serial.print(count);
+   Serial.println(" devices.");
   
-  Serial.println("Scan complete.");
-  Serial.print("Found ");
-  int count = discoveredDeviceCount;
-  Serial.print(count);
-  Serial.println(" devices with HR service.");
-  
-  discoveredDeviceCount = 0;
-  
-  for (int i = 0; i < MAX_SENSOR_SLOTS; i++) {
+   discoveredDeviceCount = 0;
+
+   // Resume advertising after scan
+   startAdvertising();
+
+   for (int i = 0; i < MAX_SENSOR_SLOTS; i++) {
     if (!macIsUnused(sensorSlots[i].macAddress)) {
         Serial.print(" Slot ");
         Serial.print(i);
@@ -400,9 +419,7 @@ void scanForSensors() {
       }
       Serial.println();
     }
-  }
-  
-  startAdvertising();
+    }
 }
 
 // ── Setup Function ─────────────────────────────────────────────────────────
@@ -413,7 +430,6 @@ void setup() {
   Serial.println(F("\n=== espHrHub Starting ==="));
   
   pinMode(BUTTON_PIN, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), handleButtonInterrupt, FALLING);
   Serial.println(F("BOOT button configured on GPIO0 — press to scan for sensors"));
   
   pinMode(LED_PIN, OUTPUT);
@@ -467,65 +483,25 @@ void setup() {
   }
   
   Serial.println(F("\n=== Setup Complete ==="));
-  
-  // Auto-scan for sensors if none are configured
-  bool hasConfiguredSensor = false;
-  for (int i = 0; i < MAX_SENSOR_SLOTS; i++) {
-    if (!macIsUnused(sensorSlots[i].macAddress)) {
-      hasConfiguredSensor = true;
-      break;
-    }
-  }
-  
-  if (!hasConfiguredSensor) {
-    Serial.println(F("\nNo sensors configured. Scanning for HR sensors..."));
-    scanForSensors();
-    
-     // Display discovered devices
-     Serial.println(F("\nDiscovered HR Sensors:"));
-     if (discoveredDeviceCount > 0) {
-       for (int i = 0; i < discoveredDeviceCount; i++) {
-         Serial.print("   [");
-         Serial.print(i);
-         Serial.print("] Name: ");
-         if (discoveredDevices[i].name.length() > 0) {
-           Serial.print(discoveredDevices[i].name);
-          } else {
-           Serial.print(F("(unknown)"));
-          }
-         Serial.print(F("  MAC: "));
-         const uint8_t* mac = discoveredDevices[i].address.getVal();
-         for (int j = 0; j < 6; j++) {
-           Serial.print(mac[j], HEX);
-           if (j < 5) Serial.print(F(":"));
-          }
-         Serial.print(F("  RSSI: "));
-         Serial.println(discoveredDevices[i].rssi);
-        }
-       
-        // Auto-connect to first discovered sensor after 5 seconds
-       Serial.println(F("\nAuto-connecting to first device in 5 seconds..."));
-       delay(5000);
-       
-       if (discoveredDeviceCount > 0) {
-         memcpy(sensorSlots[0].macAddress, discoveredDevices[0].address.getVal(), 6);
-         Serial.println(F("Auto-configured slot 0 with discovered sensor."));
-        if (connectToSensor(0)) {
-          activeSensorIndex = 0;
-          ledMode = LED_MODE_CONNECTED;
-        }
-      }
-    } else {
-      Serial.println(F("  No HR sensors found."));
-      Serial.println(F("  Press button or send 'S' to scan manually."));
-    }
-  } else {
-    Serial.println(F("Sensors configured. Ready for connection."));
-  }
+  Serial.println(F(""));
+  Serial.println(F("Ready. Apple Watch should see 'espHRhub' in HR sensors list."));
+  Serial.println(F("Press BOOT button (GPIO0) to scan for external HR straps."));
 }
 
 // ── Main Loop ──────────────────────────────────────────────────────────────
 void loop() {
+  // Poll BOOT button (GPIO0) with debounce
+  static unsigned long lastBtnCheck = 0;
+  static bool lastBtnState = HIGH;
+  if (millis() - lastBtnCheck > 50) {
+    bool btnState = digitalRead(BUTTON_PIN);
+    if (btnState == LOW && lastBtnState == HIGH) {
+      buttonScanRequested = true;
+    }
+    lastBtnState = btnState;
+    lastBtnCheck = millis();
+  }
+
   handleSerialInput();
   
   if (buttonScanRequested) {
