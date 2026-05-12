@@ -30,6 +30,7 @@ int activeSensorIndex = -1;
 uint8_t lastBPMFromAnySensor = 70;
 bool watchConnected = false;
 int ledMode = LED_MODE_OFF;
+volatile bool buttonScanRequested = false;
 
 // Reconnection tracking
 unsigned long lastReconnectAttempt[MAX_SENSOR_SLOTS] = {0};
@@ -85,23 +86,22 @@ int discoveredDeviceCount = 0;
 
 class ScanCallbacks : public NimBLEScanCallbacks {
 public:
-  int discoveredCount;
   DiscoveredDevice* devices;
   
-  ScanCallbacks() : discoveredCount(0), devices(discoveredDevices) {}
+  ScanCallbacks() : devices(discoveredDevices) {}
   
   void onResult(const NimBLEAdvertisedDevice* advertisedDevice) override {
     NimBLEUUID uuid("180D");
     if (advertisedDevice->haveServiceData() ||
         advertisedDevice->getServiceUUID().equals(uuid)) {
-      if (discoveredCount < MAX_SENSOR_SLOTS) {
-        devices[discoveredCount].name = advertisedDevice->getName().c_str();
-        devices[discoveredCount].address = advertisedDevice->getAddress();
-        devices[discoveredCount].rssi = advertisedDevice->getRSSI();
-      }
-      discoveredCount++;
-    }
-  }
+      if (discoveredDeviceCount < MAX_SENSOR_SLOTS) {
+        devices[discoveredDeviceCount].name = advertisedDevice->getName().c_str();
+        devices[discoveredDeviceCount].address = advertisedDevice->getAddress();
+        devices[discoveredDeviceCount].rssi = advertisedDevice->getRSSI();
+       }
+      discoveredDeviceCount++;
+     }
+   }
 };
 
 void hrNotificationCallback(NimBLERemoteCharacteristic* characteristic, 
@@ -248,8 +248,8 @@ void IRAM_ATTR handleButtonInterrupt() {
   unsigned long interruptTime = millis();
   
   if (interruptTime - lastInterruptTime > 200) {
-    Serial.println("Button pressed - initiating scan...");
-  }
+    buttonScanRequested = true;
+   }
   lastInterruptTime = interruptTime;
 }
 
@@ -322,9 +322,16 @@ void setupBLE() {
   
   NimBLEService* hrService = pPeripheralServer->createService("180D");
   pHRSensorCharacteristic = hrService->createCharacteristic(
-    "2A37", 
+     "2A37", 
     NIMBLE_PROPERTY::NOTIFY
-  );
+   );
+  // Add Body Sensor Location characteristic (2A38) for Apple Watch compatibility
+  // Values: 0=Other, 1=chest, 2=wrist, 3=thumb, 4=finger, 5=earlobe, 6=foot
+  uint8_t bsl = 2; // wrist
+  hrService->createCharacteristic(
+    "2A38", 
+    NIMBLE_PROPERTY::READ
+  )->setValue(&bsl, 1);
   hrService->start();
   
   pPeripheralAdvertising = NimBLEDevice::getAdvertising();
@@ -333,7 +340,11 @@ void setupBLE() {
 void startAdvertising() {
   if (pPeripheralAdvertising) {
     pPeripheralAdvertising->addServiceUUID("180D");
+    pPeripheralAdvertising->setAppearance(0x0340);         // Heart Rate Sensor
+    pPeripheralAdvertising->setName("espHRhub");
+    pPeripheralAdvertising->enableScanResponse(true);
     pPeripheralAdvertising->start();
+    Serial.println(F("BLE advertising started as 'espHRhub' (HR sensor)"));
   }
 }
 
@@ -371,11 +382,12 @@ void scanForSensors() {
   
   for (int i = 0; i < MAX_SENSOR_SLOTS; i++) {
     if (!macIsUnused(sensorSlots[i].macAddress)) {
-      Serial.print(" Slot ");
-      Serial.print(i);
-      Serial.print(": ");
-      for (int j = 0; j < 6; j++) {
-        Serial.print(sensorSlots[i].macAddress[j], HEX);
+        Serial.print(" Slot ");
+        Serial.print(i);
+        Serial.print(": ");
+        for (int j = 0; j < 6; j++) {
+          if (sensorSlots[i].macAddress[j] < 16) Serial.print("0");
+          Serial.print(sensorSlots[i].macAddress[j], HEX);
         if (j < 5) Serial.print(":");
       }
       
@@ -399,6 +411,7 @@ void setup() {
   
   pinMode(BUTTON_PIN, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), handleButtonInterrupt, FALLING);
+  Serial.println(F("BOOT button configured on GPIO0 — press to scan for sensors"));
   
   pinMode(LED_PIN, OUTPUT);
   ledMode = LED_MODE_OFF;
@@ -511,6 +524,19 @@ void setup() {
 // ── Main Loop ──────────────────────────────────────────────────────────────
 void loop() {
   handleSerialInput();
+  
+  if (buttonScanRequested) {
+    buttonScanRequested = false;
+    Serial.println(F("\n[BOOT button] Initiating sensor scan..."));
+    ledMode = LED_MODE_SCANNING;
+    scanForSensors();
+    if (activeSensorIndex != -1 && macIsConnected(activeSensorIndex)) {
+      ledMode = LED_MODE_CONNECTED;
+     } else {
+      ledMode = LED_MODE_OFF;
+     }
+   }
+  
   checkSensorReconnections();
   updateLED();
   
