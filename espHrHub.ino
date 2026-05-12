@@ -127,6 +127,8 @@ public:
     }
     Serial.print(F("  RSSI: " ));
     Serial.print(advertisedDevice->getRSSI());
+    Serial.print(F("  conn:"));
+    Serial.print(advertisedDevice->isConnectable() ? "YES" : "NO");
     if (advertisedDevice->haveServiceUUID()) {
         Serial.print(F("  UUID: " ));
         Serial.print(advertisedDevice->getServiceUUID().toString().c_str());
@@ -135,6 +137,51 @@ public:
         Serial.print(F("  [has service data]"));
     }
     Serial.println();
+    
+    // Check if this is our configured sensor and auto-connect immediately
+    if (advertisedDevice->isConnectable() && discoveredDeviceCount == 0) {
+        for (int i = 0; i < MAX_SENSOR_SLOTS; i++) {
+            if (!macIsUnused(sensorSlots[i].macAddress)) {
+                NimBLEAddress configuredAddr(sensorSlots[i].macAddress, BLE_ADDR_PUBLIC);
+                if (advertisedDevice->getAddress().equals(configuredAddr)) {
+                    Serial.println(F("[AUTO-CONN] Found configured sensor during scan, connecting NOW..."));
+                    // Stop scan to connect
+                    NimBLEDevice::getScan()->stop();
+                    // Use the advertised address directly (has correct type)
+                    SensorSlot* slot = &sensorSlots[i];
+                    if (slot->client != nullptr) {
+                        if (slot->isConnected && slot->client->isConnected()) {
+                            slot->client->disconnect();
+                        }
+                        NimBLEDevice::deleteClient(slot->client);
+                        slot->client = nullptr;
+                    }
+                    slot->client = NimBLEDevice::createClient();
+                    NimBLEDevice::setSecurityAuth(true, true, true);
+                    NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);
+                    if (slot->client->connect(advertisedDevice->getAddress())) {
+                        NimBLERemoteService* svc = slot->client->getService("180D");
+                        if (svc) {
+                            NimBLERemoteCharacteristic* chr = svc->getCharacteristic("2A37");
+                            if (chr && chr->canNotify()) {
+                                chr->subscribe(true, hrNotificationCallback);
+                                slot->hrCharacteristic = chr;
+                                slot->isConnected = true;
+                                activeSensorIndex = i;
+                                Serial.println(F("[AUTO-CONN] Connected during scan!"));
+                            }
+                        }
+                    } else {
+                        Serial.println(F("[AUTO-CONN] Connect failed during scan"));
+                        NimBLEDevice::deleteClient(slot->client);
+                        slot->client = nullptr;
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    
     discoveredDeviceCount++;
 }
 };
@@ -206,19 +253,54 @@ bool connectToSensor(int slotIndex) {
     slot->client = nullptr;
   }
   
+  Serial.print("[CONN] Connecting to MAC: ");
+  for (int j = 0; j < 6; j++) {
+    if (slot->macAddress[j] < 0x10) Serial.print("0");
+    Serial.print(slot->macAddress[j], HEX);
+    if (j < 5) Serial.print(":");
+  }
+  Serial.print(" type=PUBLIC");
+  Serial.println();
+  
   NimBLEAddress address(slot->macAddress, BLE_ADDR_PUBLIC);
   slot->client = NimBLEDevice::createClient();
   
-  Serial.print("Connecting to sensor at slot ");
-  Serial.print(slotIndex);
-  Serial.print("...");
+  // Enable security (some straps require bonding)
+  NimBLEDevice::setSecurityAuth(true, true, true);
+  NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);
   
-  if (!slot->client->connect(address)) {
-    Serial.println(" FAILED");
-    Serial.println("  [DEBUG] connect() returned false — strap may be connected to another device (phone/watch)");
-    NimBLEDevice::deleteClient(slot->client);
-    slot->client = nullptr;
-    return false;
+  // Increase connection timeout and set params for TICKR FIT
+  slot->client->setConnectTimeout(10); // 10 seconds
+  slot->client->setConnectionParams(6, 12, 0, 500); // min=7.5ms, max=15ms, latency=0, timeout=5s
+  
+  Serial.print("[CONN] Connecting with 10s timeout...");
+  
+  // Try synchronous connect first
+  if (!slot->client->connect(address, true, false, true)) {
+    Serial.println(" FAILED (sync)");
+    
+    // Try async connect and wait
+    Serial.print("[CONN] Trying async connect...");
+    if (slot->client->connect(address, true, true, true)) {
+      Serial.println(" async started");
+      // Wait up to 10 seconds for connection
+      unsigned long startConn = millis();
+      while (!slot->client->isConnected() && millis() - startConn < 10000) {
+        delay(100);
+      }
+      if (!slot->client->isConnected()) {
+        Serial.println("[CONN] Async connect timed out");
+        NimBLEDevice::deleteClient(slot->client);
+        slot->client = nullptr;
+        return false;
+      }
+      Serial.println("[CONN] Async connect succeeded!");
+    } else {
+      Serial.println(" FAILED (async too)");
+      NimBLEDevice::deleteClient(slot->client);
+      slot->client = nullptr;
+      return false;
+    }
   }
   
   Serial.println(" OK");

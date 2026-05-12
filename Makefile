@@ -1,4 +1,4 @@
-.PHONY: verify build upload flash-only test lint
+.PHONY: verify build upload flash-only test lint reset-strap
 
 BOARD         ?= esp32:esp32:esp32
 SKETCH_DIR     ?= $(CURDIR)
@@ -28,6 +28,10 @@ test: build
 	else \
 		echo "No ESP32 hardware detected. Code compiles and is ready for testing."; \
 	fi
+
+reset-strap:
+	@echo "Resetting ESP32 and triggering HR strap scan..."
+	@python3 "$(SKETCH_DIR)/scripts/reset-strap.py"
 
 lint:
 	@echo "Running syntax check on Python tests..."
