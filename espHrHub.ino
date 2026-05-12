@@ -98,11 +98,15 @@ public:
         devices[discoveredDeviceCount].name = advertisedDevice->getName().c_str();
         devices[discoveredDeviceCount].address = advertisedDevice->getAddress();
         devices[discoveredDeviceCount].rssi = advertisedDevice->getRSSI();
-       }
+        }
       discoveredDeviceCount++;
-     }
-   }
+      }
+    }
 };
+
+// File-global — lives for the entire program lifetime so NimBLE's raw pointer
+// to this callback never dangles (fixes InstrFetchProhibited panic on Core 0).
+ScanCallbacks scanCallbacks;
 
 void hrNotificationCallback(NimBLERemoteCharacteristic* characteristic, 
                             uint8_t* data, size_t len, bool isNotify) {
@@ -368,7 +372,6 @@ void scanForSensors() {
    Serial.println(MAX_SENSOR_SLOTS);
   
   NimBLEScan* pScan = NimBLEDevice::getScan();
-  ScanCallbacks scanCallbacks;
   pScan->setScanCallbacks(&scanCallbacks);
   pScan->start(SCAN_DURATION_MS / 1000.0, false);
   
