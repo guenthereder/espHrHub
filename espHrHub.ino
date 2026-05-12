@@ -62,11 +62,24 @@ bool macIsConnected(int slotIndex) {
 class ServerCallbacks : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer* server, NimBLEConnInfo& connInfo) {
     watchConnected = true;
+    Serial.println(F(">>> Apple Watch CONNECTED <<<"));
   }
 
-  void onDisconnect(NimBLEServer* server) {
+  void onDisconnect(NimBLEServer* server, NimBLEConnInfo& connInfo) {
     watchConnected = false;
+    Serial.println(F(">>> Apple Watch DISCONNECTED <<<"));
     pPeripheralAdvertising->start();
+  }
+};
+
+class HRCharacteristicCallbacks : public NimBLECharacteristicCallbacks {
+  void onSubscribe(NimBLECharacteristic* pCharacteristic, NimBLEConnInfo& connInfo, uint16_t subValue) {
+    Serial.print(F("[SUBSCRIBE] Apple Watch subscribed to HR notifications, subValue="));
+    Serial.println(subValue);
+  }
+  
+  void onUnsubscribe(NimBLECharacteristic* pCharacteristic, NimBLEConnInfo& connInfo) {
+    Serial.println(F("[SUBSCRIBE] Apple Watch unsubscribed from HR notifications"));
   }
 };
 
@@ -132,10 +145,45 @@ ScanCallbacks scanCallbacks;
 
 void hrNotificationCallback(NimBLERemoteCharacteristic* characteristic, 
                             uint8_t* data, size_t len, bool isNotify) {
-  lastBPMFromAnySensor = data[1];
+  if (len < 2) return;
+  
+  uint8_t flags = data[0];
+  uint16_t bpm = 0;
+  int idx = 1;
+  
+  if (flags & 0x01) {
+    // 16-bit heart rate
+    if (len >= 3) {
+      bpm = data[idx] | (data[idx+1] << 8);
+      idx += 2;
+    }
+  } else {
+    // 8-bit heart rate
+    bpm = data[idx];
+    idx++;
+  }
+  
+  lastBPMFromAnySensor = bpm;
+  
+  Serial.print(F("[HR] Received from strap: flags=0x"));
+  Serial.print(flags, HEX);
+  Serial.print(F(" BPM="));
+  Serial.print(bpm);
+  Serial.print(F(" raw=["));
+  for (size_t i = 0; i < len; i++) {
+    if (i > 0) Serial.print(" ");
+    Serial.print(data[i], HEX);
+  }
+  Serial.println(F("]"));
+  
   if (watchConnected && pHRSensorCharacteristic != nullptr) {
+    // Forward raw packet as-is
     pHRSensorCharacteristic->setValue(data, len);
-    pHRSensorCharacteristic->notify();
+    if (pHRSensorCharacteristic->notify()) {
+      Serial.println(F("[HR] Forwarded to Apple Watch"));
+    } else {
+      Serial.println(F("[HR] FAILED to notify Apple Watch (not subscribed?)"));
+    }
   }
 };
 
@@ -167,6 +215,7 @@ bool connectToSensor(int slotIndex) {
   
   if (!slot->client->connect(address)) {
     Serial.println(" FAILED");
+    Serial.println("  [DEBUG] connect() returned false — strap may be connected to another device (phone/watch)");
     NimBLEDevice::deleteClient(slot->client);
     slot->client = nullptr;
     return false;
@@ -289,6 +338,15 @@ void handleSerialInput() {
     else if (cmd == COMMAND_SELECT_4 || cmd == '4') {
       switchActiveSensor(3);
     }
+    else if (cmd == 'c' || cmd == 'C') {
+      Serial.println("[CMD] Force reconnect to slot 0...");
+      if (connectToSensor(0)) {
+        activeSensorIndex = 0;
+        Serial.println("[CMD] Connected!");
+      } else {
+        Serial.println("[CMD] Failed");
+      }
+    }
     else if (cmd == COMMAND_HELP || cmd == '?') {
       Serial.println(F("===espHrHub Help==="));
       Serial.println(F("S/s - Scan for sensors"));
@@ -338,9 +396,10 @@ void setupBLE() {
   
   NimBLEService* hrService = pPeripheralServer->createService("180D");
   pHRSensorCharacteristic = hrService->createCharacteristic(
-     "2A37", 
-    NIMBLE_PROPERTY::NOTIFY
-   );
+      "2A37", 
+    NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY
+    );
+  pHRSensorCharacteristic->setCallbacks(new HRCharacteristicCallbacks());
   // Add Body Sensor Location characteristic (2A38) for Apple Watch compatibility
   // Values: 0=Other, 1=chest, 2=wrist, 3=thumb, 4=finger, 5=earlobe, 6=foot
   uint8_t bsl = 2; // wrist
@@ -366,7 +425,7 @@ void startAdvertising() {
   }
 }
 
-void scanForSensors() {
+int scanForSensors() {
    // Reset discovered devices array
    for (int i = 0; i < MAX_SENSOR_SLOTS; i++) {
      discoveredDevices[i].name = "";
@@ -389,7 +448,7 @@ void scanForSensors() {
   
     NimBLEScan* pScan = NimBLEDevice::getScan();
     pScan->setScanCallbacks(&scanCallbacks);
-    pScan->start(SCAN_DURATION_MS / 1000.0, false);
+    pScan->start(SCAN_DURATION_MS, false);
   
    Serial.println("Scan complete.");
    Serial.print("Found ");
@@ -399,27 +458,11 @@ void scanForSensors() {
   
    discoveredDeviceCount = 0;
 
-   // Resume advertising after scan
-   startAdvertising();
+    // Resume advertising after scan
+    startAdvertising();
 
-   for (int i = 0; i < MAX_SENSOR_SLOTS; i++) {
-    if (!macIsUnused(sensorSlots[i].macAddress)) {
-        Serial.print(" Slot ");
-        Serial.print(i);
-        Serial.print(": ");
-        for (int j = 0; j < 6; j++) {
-          if (sensorSlots[i].macAddress[j] < 16) Serial.print("0");
-          Serial.print(sensorSlots[i].macAddress[j], HEX);
-        if (j < 5) Serial.print(":");
-      }
-      
-      if (!macIsConnected(i) && reconnectDelayMs[i] == 1000) {
-        Serial.print(" [connecting]");
-        connectToSensor(i);
-      }
-      Serial.println();
-    }
-    }
+    // Return number of devices found so caller can auto-connect
+    return count;
 }
 
 // ── Setup Function ─────────────────────────────────────────────────────────
@@ -506,14 +549,53 @@ void loop() {
   
   if (buttonScanRequested) {
     buttonScanRequested = false;
-    Serial.println(F("\n[BOOT button] Initiating sensor scan..."));
+    Serial.println("\n[BOOT button] Scanning for HR sensors...");
     ledMode = LED_MODE_SCANNING;
-    scanForSensors();
+    int foundCount = scanForSensors();
+    
+    // If we found sensors, auto-connect to the first one with HR service (180D)
+    bool connected = false;
+    for (int i = 0; i < foundCount; i++) {
+      // Check if this device advertises HR service 180D
+      // We can't check here easily, so just try connecting to all non-empty slots
+      // The scan callback would have stored devices
+      // Actually, let's check the discoveredDevices array for any device
+      if (discoveredDevices[i].address.toString() != "00:00:00:00:00:00") {
+        Serial.print("[BOOT] Found device: ");
+        Serial.print(discoveredDevices[i].name.length() > 0 ? discoveredDevices[i].name.c_str() : "(no name)");
+        Serial.print(" at MAC ");
+        const uint8_t* m = discoveredDevices[i].address.getVal();
+        for (int j = 0; j < 6; j++) {
+          if (m[j] < 0x10) Serial.print("0");
+          Serial.print(m[j], HEX);
+          if (j < 5) Serial.print(":");
+        }
+        Serial.println();
+        
+        // Store MAC in slot 0
+        memcpy(sensorSlots[0].macAddress, discoveredDevices[i].address.getVal(), 6);
+        Serial.println("[BOOT] Auto-stored in slot 0");
+        
+        if (connectToSensor(0)) {
+          activeSensorIndex = 0;
+          connected = true;
+          Serial.println("[BOOT] Connected to HR sensor!");
+          break;
+        } else {
+          Serial.println("[BOOT] Failed to connect");
+        }
+      }
+    }
+    
+    if (!connected) {
+      Serial.println("[BOOT] No HR sensors connected. Will retry via auto-reconnect.");
+    }
+    
     if (activeSensorIndex != -1 && macIsConnected(activeSensorIndex)) {
       ledMode = LED_MODE_CONNECTED;
-     } else {
+    } else {
       ledMode = LED_MODE_OFF;
-     }
+    }
    }
   
   checkSensorReconnections();
