@@ -1,1 +1,9 @@
-config.h
+# build files and cache
+**/__pycache__
+.venv
+
+# env file
+.env
+
+# ai harness files
+.opencode
