@@ -62,27 +62,47 @@ class ServerCallbacks : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer* server, NimBLEConnInfo& connInfo) {
     watchConnected = true;
   }
-  
+
   void onDisconnect(NimBLEServer* server) {
     watchConnected = false;
     pPeripheralAdvertising->start();
   }
 };
 
+// Structure to store discovered HR sensor information
+struct DiscoveredDevice {
+  String name;
+  NimBLEAddress address;
+  int rssi;
+};
+
+// File-global discovered devices array — avoids static member array crash
+// on ESP32 where static member arrays of complex types (e.g. NimBLEAddress)
+// can have incomplete type issues that cause InstrFetchProhibited panics
+// on core 0 (BLE core) during NimBLE callbacks.
+DiscoveredDevice discoveredDevices[MAX_SENSOR_SLOTS];
+int discoveredDeviceCount = 0;
+
 class ScanCallbacks : public NimBLEScanCallbacks {
 public:
-  static int discoveredCount;
+  int discoveredCount;
+  DiscoveredDevice* devices;
+  
+  ScanCallbacks() : discoveredCount(0), devices(discoveredDevices) {}
   
   void onResult(const NimBLEAdvertisedDevice* advertisedDevice) override {
     NimBLEUUID uuid("180D");
     if (advertisedDevice->haveServiceData() ||
         advertisedDevice->getServiceUUID().equals(uuid)) {
+      if (discoveredCount < MAX_SENSOR_SLOTS) {
+        devices[discoveredCount].name = advertisedDevice->getName().c_str();
+        devices[discoveredCount].address = advertisedDevice->getAddress();
+        devices[discoveredCount].rssi = advertisedDevice->getRSSI();
+      }
       discoveredCount++;
     }
   }
 };
-
-int ScanCallbacks::discoveredCount = 0;
 
 void hrNotificationCallback(NimBLERemoteCharacteristic* characteristic, 
                             uint8_t* data, size_t len, bool isNotify) {
@@ -318,11 +338,23 @@ void startAdvertising() {
 }
 
 void scanForSensors() {
+  // Reset discovered devices array
+   for (int i = 0; i < MAX_SENSOR_SLOTS; i++) {
+    discoveredDevices[i].name = "";
+    discoveredDevices[i].address = NimBLEAddress((uint8_t[]){0,0,0,0,0,0}, BLE_ADDR_PUBLIC);
+    discoveredDevices[i].rssi = 0;
+   }
+  
   if (pPeripheralAdvertising) {
     pPeripheralAdvertising->stop();
-  }
+   }
   
-  Serial.println("Scanning for HR sensors (180D)...");
+   Serial.println("Scanning for HR sensors (UUID 180D)...");
+   Serial.print("Scan duration: ");
+   Serial.print(SCAN_DURATION_MS);
+   Serial.println(" ms");
+   Serial.print("Max sensor slots: ");
+   Serial.println(MAX_SENSOR_SLOTS);
   
   NimBLEScan* pScan = NimBLEDevice::getScan();
   ScanCallbacks scanCallbacks;
@@ -331,11 +363,11 @@ void scanForSensors() {
   
   Serial.println("Scan complete.");
   Serial.print("Found ");
-  int count = ScanCallbacks::discoveredCount;
+  int count = discoveredDeviceCount;
   Serial.print(count);
   Serial.println(" devices with HR service.");
   
-  ScanCallbacks::discoveredCount = 0;
+  discoveredDeviceCount = 0;
   
   for (int i = 0; i < MAX_SENSOR_SLOTS; i++) {
     if (!macIsUnused(sensorSlots[i].macAddress)) {
@@ -419,6 +451,61 @@ void setup() {
   }
   
   Serial.println(F("\n=== Setup Complete ==="));
+  
+  // Auto-scan for sensors if none are configured
+  bool hasConfiguredSensor = false;
+  for (int i = 0; i < MAX_SENSOR_SLOTS; i++) {
+    if (!macIsUnused(sensorSlots[i].macAddress)) {
+      hasConfiguredSensor = true;
+      break;
+    }
+  }
+  
+  if (!hasConfiguredSensor) {
+    Serial.println(F("\nNo sensors configured. Scanning for HR sensors..."));
+    scanForSensors();
+    
+     // Display discovered devices
+     Serial.println(F("\nDiscovered HR Sensors:"));
+     if (discoveredDeviceCount > 0) {
+       for (int i = 0; i < discoveredDeviceCount; i++) {
+         Serial.print("   [");
+         Serial.print(i);
+         Serial.print("] Name: ");
+         if (discoveredDevices[i].name.length() > 0) {
+           Serial.print(discoveredDevices[i].name);
+          } else {
+           Serial.print(F("(unknown)"));
+          }
+         Serial.print(F("  MAC: "));
+         const uint8_t* mac = discoveredDevices[i].address.getVal();
+         for (int j = 0; j < 6; j++) {
+           Serial.print(mac[j], HEX);
+           if (j < 5) Serial.print(F(":"));
+          }
+         Serial.print(F("  RSSI: "));
+         Serial.println(discoveredDevices[i].rssi);
+        }
+       
+        // Auto-connect to first discovered sensor after 5 seconds
+       Serial.println(F("\nAuto-connecting to first device in 5 seconds..."));
+       delay(5000);
+       
+       if (discoveredDeviceCount > 0) {
+         memcpy(sensorSlots[0].macAddress, discoveredDevices[0].address.getVal(), 6);
+         Serial.println(F("Auto-configured slot 0 with discovered sensor."));
+        if (connectToSensor(0)) {
+          activeSensorIndex = 0;
+          ledMode = LED_MODE_CONNECTED;
+        }
+      }
+    } else {
+      Serial.println(F("  No HR sensors found."));
+      Serial.println(F("  Press button or send 'S' to scan manually."));
+    }
+  } else {
+    Serial.println(F("Sensors configured. Ready for connection."));
+  }
 }
 
 // ── Main Loop ──────────────────────────────────────────────────────────────
