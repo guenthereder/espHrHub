@@ -1,17 +1,25 @@
 /*
- * espHrHub.ino - BLE Heart Rate Hub
+ * espHrHub.ino - BLE Heart Rate Hub (Arduino BLE Library version)
  * 
  * Central device that connects to HR sensors (UUID 180D) and forwards
  * heart rate data to Apple Watch via BLE server advertising.
+ * 
+ * Uses Arduino's built-in BLE library instead of NimBLE-Arduino.
+ * Key fix: pClient->connect(advertisedDevice) uses correct address type.
  */
 
-#include <NimBLEDevice.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+#include <BLEScan.h>
 #include "config.h"
 
 // ── Global State ───────────────────────────────────────────────────────────
-NimBLEServer* pPeripheralServer = nullptr;
-NimBLEAdvertising* pPeripheralAdvertising = nullptr;
-NimBLECharacteristic* pHRSensorCharacteristic = nullptr;
+BLEServer* pPeripheralServer = nullptr;
+BLEAdvertising* pPeripheralAdvertising = nullptr;
+BLECharacteristic* pHRSensorCharacteristic = nullptr;
+BLE2902* pHRDescriptor2902 = nullptr;
 
 // Sensor slots
 struct SensorSlot {
@@ -19,8 +27,9 @@ struct SensorSlot {
   uint8_t lastBPM;
   unsigned long lastTimestamp;
   bool isConnected;
-  NimBLEClient* client;
-  NimBLERemoteCharacteristic* hrCharacteristic;
+  BLEClient* client;
+  BLEClientCallbacks* clientCallbacks;
+  BLERemoteCharacteristic* hrCharacteristic;
 };
 
 static SensorSlot sensorSlots[MAX_SENSOR_SLOTS];
@@ -59,138 +68,95 @@ bool macIsConnected(int slotIndex) {
 }
 
 // ── BLE Callback Classes ───────────────────────────────────────────────────
-class ServerCallbacks : public NimBLEServerCallbacks {
-  void onConnect(NimBLEServer* server, NimBLEConnInfo& connInfo) {
+class ServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer* server) {
     watchConnected = true;
     Serial.println(F(">>> Apple Watch CONNECTED <<<"));
   }
 
-  void onDisconnect(NimBLEServer* server, NimBLEConnInfo& connInfo) {
+  void onDisconnect(BLEServer* server) {
     watchConnected = false;
     Serial.println(F(">>> Apple Watch DISCONNECTED <<<"));
-    pPeripheralAdvertising->start();
-  }
-};
-
-class HRCharacteristicCallbacks : public NimBLECharacteristicCallbacks {
-  void onSubscribe(NimBLECharacteristic* pCharacteristic, NimBLEConnInfo& connInfo, uint16_t subValue) {
-    Serial.print(F("[SUBSCRIBE] Apple Watch subscribed to HR notifications, subValue="));
-    Serial.println(subValue);
-  }
-  
-  void onUnsubscribe(NimBLECharacteristic* pCharacteristic, NimBLEConnInfo& connInfo) {
-    Serial.println(F("[SUBSCRIBE] Apple Watch unsubscribed from HR notifications"));
+    BLEDevice::startAdvertising();
   }
 };
 
 // Structure to store discovered HR sensor information
 struct DiscoveredDevice {
   String name;
-  NimBLEAddress address;
+  BLEAddress address;
   int rssi;
+  bool hasHRService;
 };
 
-// File-global discovered devices array — avoids static member array crash
-// on ESP32 where static member arrays of complex types (e.g. NimBLEAddress)
-// can have incomplete type issues that cause InstrFetchProhibited panics
-// on core 0 (BLE core) during NimBLE callbacks.
+// Forward declarations
+int scanForSensors();
+bool connectToSensor(int slotIndex);
+void startAdvertising();
+
 DiscoveredDevice discoveredDevices[MAX_SENSOR_SLOTS];
 int discoveredDeviceCount = 0;
+// Discovered device info for auto-connect (address type only, to avoid heap/UAF races)
+volatile int8_t foundAddrType = -1;
 
-class ScanCallbacks : public NimBLEScanCallbacks {
-public:
-  DiscoveredDevice* devices;
-  
-  ScanCallbacks() : devices(discoveredDevices) {}
-  
-  void onResult(const NimBLEAdvertisedDevice* advertisedDevice) override {
+class ScanCallbacks : public BLEAdvertisedDeviceCallbacks {
+  void onResult(BLEAdvertisedDevice advertisedDevice) override {
     if (discoveredDeviceCount < MAX_SENSOR_SLOTS) {
-        devices[discoveredDeviceCount].name = advertisedDevice->getName().c_str();
-        devices[discoveredDeviceCount].address = advertisedDevice->getAddress();
-        devices[discoveredDeviceCount].rssi = advertisedDevice->getRSSI();
+        discoveredDevices[discoveredDeviceCount].name = advertisedDevice.haveName() ? String(advertisedDevice.getName().c_str()) : "(no name)";
+        discoveredDevices[discoveredDeviceCount].address = advertisedDevice.getAddress();
+        discoveredDevices[discoveredDeviceCount].rssi = advertisedDevice.getRSSI();
+        discoveredDevices[discoveredDeviceCount].hasHRService = advertisedDevice.haveServiceUUID() &&
+            advertisedDevice.getServiceUUID().equals(BLEUUID("180D"));
+        
+        // Auto-connect if this matches a configured sensor — just capture address type
+        // CRITICAL: NimBLE stores address bytes in INVERSE order internally.
+        // getNative() returns reversed bytes. macEquals() would compare reversed vs
+        // original config bytes — always failing. Instead, compare two BLEAddress
+        // objects (both store reversed internal bytes) via getNative().
+        for (int i = 0; i < MAX_SENSOR_SLOTS; i++) {
+          if (!macIsUnused(sensorSlots[i].macAddress)) {
+            BLEAddress configuredAddr(sensorSlots[i].macAddress, 0);
+            if (memcmp(advertisedDevice.getAddress().getNative(), configuredAddr.getNative(), 6) == 0) {
+              int8_t discoveredType = advertisedDevice.getAddress().getType();
+              Serial.print(F("[AUTO-CONN] Found configured sensor, type="));
+              Serial.println(discoveredType);
+              foundAddrType = discoveredType;
+              break;
+            }
+          }
+        }
+        
+        discoveredDeviceCount++;
     }
-    // Print every device we find
+    
     Serial.print(F("   [" ));
     Serial.print(discoveredDeviceCount);
     Serial.print(F("] " ));
-    if (advertisedDevice->haveName()) {
-        Serial.print(advertisedDevice->getName().c_str());
+    if (advertisedDevice.haveName()) {
+        Serial.print(advertisedDevice.getName().c_str());
     } else {
         Serial.print(F("(no name)"));
     }
     Serial.print(F("  MAC: " ));
-    const uint8_t* m = advertisedDevice->getAddress().getVal();
-    for (int j = 0; j < 6; j++) {
-        if (m[j] < 0x10) Serial.print('0');
-        Serial.print(m[j], HEX);
-        if (j < 5) Serial.print(':');
-    }
-    Serial.print(F("  RSSI: " ));
-    Serial.print(advertisedDevice->getRSSI());
+    Serial.print(advertisedDevice.getAddress().toString().c_str());
+    Serial.print(F("  type:"));
+    Serial.print(advertisedDevice.getAddress().getType());
+    Serial.print(F("  RSSI:"));
+    Serial.print(advertisedDevice.getRSSI());
     Serial.print(F("  conn:"));
-    Serial.print(advertisedDevice->isConnectable() ? "YES" : "NO");
-    if (advertisedDevice->haveServiceUUID()) {
+    Serial.print(advertisedDevice.isConnectable() ? "YES" : "NO");
+    if (advertisedDevice.haveServiceUUID()) {
         Serial.print(F("  UUID: " ));
-        Serial.print(advertisedDevice->getServiceUUID().toString().c_str());
-    }
-    if (advertisedDevice->haveServiceData()) {
-        Serial.print(F("  [has service data]"));
+        Serial.print(advertisedDevice.getServiceUUID().toString().c_str());
     }
     Serial.println();
-    
-    // Check if this is our configured sensor and auto-connect immediately
-    if (advertisedDevice->isConnectable() && discoveredDeviceCount == 0) {
-        for (int i = 0; i < MAX_SENSOR_SLOTS; i++) {
-            if (!macIsUnused(sensorSlots[i].macAddress)) {
-                NimBLEAddress configuredAddr(sensorSlots[i].macAddress, BLE_ADDR_PUBLIC);
-                if (advertisedDevice->getAddress().equals(configuredAddr)) {
-                    Serial.println(F("[AUTO-CONN] Found configured sensor during scan, connecting NOW..."));
-                    // Stop scan to connect
-                    NimBLEDevice::getScan()->stop();
-                    // Use the advertised address directly (has correct type)
-                    SensorSlot* slot = &sensorSlots[i];
-                    if (slot->client != nullptr) {
-                        if (slot->isConnected && slot->client->isConnected()) {
-                            slot->client->disconnect();
-                        }
-                        NimBLEDevice::deleteClient(slot->client);
-                        slot->client = nullptr;
-                    }
-                    slot->client = NimBLEDevice::createClient();
-                    NimBLEDevice::setSecurityAuth(true, true, true);
-                    NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);
-                    if (slot->client->connect(advertisedDevice->getAddress())) {
-                        NimBLERemoteService* svc = slot->client->getService("180D");
-                        if (svc) {
-                            NimBLERemoteCharacteristic* chr = svc->getCharacteristic("2A37");
-                            if (chr && chr->canNotify()) {
-                                chr->subscribe(true, hrNotificationCallback);
-                                slot->hrCharacteristic = chr;
-                                slot->isConnected = true;
-                                activeSensorIndex = i;
-                                Serial.println(F("[AUTO-CONN] Connected during scan!"));
-                            }
-                        }
-                    } else {
-                        Serial.println(F("[AUTO-CONN] Connect failed during scan"));
-                        NimBLEDevice::deleteClient(slot->client);
-                        slot->client = nullptr;
-                    }
-                    break;
-                }
-            }
-        }
-    }
-    
-    discoveredDeviceCount++;
-}
+  }
 };
 
-// File-global — lives for the entire program lifetime so NimBLE's raw pointer
-// to this callback never dangles (fixes InstrFetchProhibited panic on Core 0).
-ScanCallbacks scanCallbacks;
+// Static scan callback instance to avoid heap allocation on every scan
+static ScanCallbacks scanCallbacks;
 
-void hrNotificationCallback(NimBLERemoteCharacteristic* characteristic, 
+void hrNotificationCallback(BLERemoteCharacteristic* characteristic,
                             uint8_t* data, size_t len, bool isNotify) {
   if (len < 2) return;
   
@@ -199,13 +165,11 @@ void hrNotificationCallback(NimBLERemoteCharacteristic* characteristic,
   int idx = 1;
   
   if (flags & 0x01) {
-    // 16-bit heart rate
     if (len >= 3) {
       bpm = data[idx] | (data[idx+1] << 8);
       idx += 2;
     }
   } else {
-    // 8-bit heart rate
     bpm = data[idx];
     idx++;
   }
@@ -224,12 +188,25 @@ void hrNotificationCallback(NimBLERemoteCharacteristic* characteristic,
   Serial.println(F("]"));
   
   if (watchConnected && pHRSensorCharacteristic != nullptr) {
-    // Forward raw packet as-is
     pHRSensorCharacteristic->setValue(data, len);
-    if (pHRSensorCharacteristic->notify()) {
-      Serial.println(F("[HR] Forwarded to Apple Watch"));
-    } else {
-      Serial.println(F("[HR] FAILED to notify Apple Watch (not subscribed?)"));
+    pHRSensorCharacteristic->notify();
+    Serial.println(F("[HR] Forwarded to Apple Watch"));
+  }
+}
+
+class ClientCallbacks : public BLEClientCallbacks {
+  void onConnect(BLEClient* pclient) {
+    Serial.println(F(">>> HR Sensor connected <<<"));
+  }
+  
+  void onDisconnect(BLEClient* pclient) {
+    Serial.println(F(">>> HR Sensor disconnected <<<"));
+    // Mark the corresponding slot as disconnected so reconnection logic kicks in
+    for (int i = 0; i < MAX_SENSOR_SLOTS; i++) {
+      if (sensorSlots[i].client == pclient) {
+        sensorSlots[i].isConnected = false;
+        break;
+      }
     }
   }
 };
@@ -249,77 +226,109 @@ bool connectToSensor(int slotIndex) {
     if (slot->isConnected && slot->client->isConnected()) {
       slot->client->disconnect();
     }
-    NimBLEDevice::deleteClient(slot->client);
+    delete slot->client;
     slot->client = nullptr;
+    slot->hrCharacteristic = nullptr; // Prevent stale pointer use
+    if (slot->clientCallbacks != nullptr) {
+      delete slot->clientCallbacks;
+      slot->clientCallbacks = nullptr;
+    }
   }
   
-  Serial.print("[CONN] Connecting to MAC: ");
+  Serial.print("[CONN] Connecting to slot ");
+  Serial.print(slotIndex);
+  Serial.print(" MAC: ");
   for (int j = 0; j < 6; j++) {
     if (slot->macAddress[j] < 0x10) Serial.print("0");
     Serial.print(slot->macAddress[j], HEX);
     if (j < 5) Serial.print(":");
   }
-  Serial.print(" type=PUBLIC");
   Serial.println();
   
-  NimBLEAddress address(slot->macAddress, BLE_ADDR_PUBLIC);
-  slot->client = NimBLEDevice::createClient();
-  
-  // Enable security (some straps require bonding)
-  NimBLEDevice::setSecurityAuth(true, true, true);
-  NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);
-  
-  // Increase connection timeout and set params for TICKR FIT
-  slot->client->setConnectTimeout(10); // 10 seconds
-  slot->client->setConnectionParams(6, 12, 0, 500); // min=7.5ms, max=15ms, latency=0, timeout=5s
-  
-  Serial.print("[CONN] Connecting with 10s timeout...");
-  
-  // Try synchronous connect first
-  if (!slot->client->connect(address, true, false, true)) {
-    Serial.println(" FAILED (sync)");
-    
-    // Try async connect and wait
-    Serial.print("[CONN] Trying async connect...");
-    if (slot->client->connect(address, true, true, true)) {
-      Serial.println(" async started");
-      // Wait up to 10 seconds for connection
-      unsigned long startConn = millis();
-      while (!slot->client->isConnected() && millis() - startConn < 10000) {
-        delay(100);
-      }
-      if (!slot->client->isConnected()) {
-        Serial.println("[CONN] Async connect timed out");
-        NimBLEDevice::deleteClient(slot->client);
-        slot->client = nullptr;
-        return false;
-      }
-      Serial.println("[CONN] Async connect succeeded!");
-    } else {
-      Serial.println(" FAILED (async too)");
-      NimBLEDevice::deleteClient(slot->client);
-      slot->client = nullptr;
-      return false;
+  slot->client = BLEDevice::createClient();
+  slot->clientCallbacks = new ClientCallbacks();
+  slot->client->setClientCallbacks(slot->clientCallbacks);
+
+  bool connected = false;
+  uint8_t typesToTry[6];
+  int typeCount = 0;
+
+  // If we discovered a type from scan, try it first
+  if (foundAddrType >= 0 && foundAddrType <= 3) {
+    typesToTry[typeCount++] = foundAddrType;
+  }
+  // Always try standard types: PUBLIC (0), RANDOM (1), PUBLIC_ID (2), RANDOM_ID (3), AUTO (0xFF)
+  uint8_t fallbackTypes[] = {0, 1, 2, 3, 0xFF};
+  for (uint8_t ft : fallbackTypes) {
+    // Skip if already added (avoid duplicates)
+    bool alreadyAdded = false;
+    for (int k = 0; k < typeCount; k++) {
+      if (typesToTry[k] == ft) { alreadyAdded = true; break; }
+    }
+    if (!alreadyAdded && typeCount < 6) {
+      typesToTry[typeCount++] = ft;
     }
   }
+
+  for (int t = 0; t < typeCount && !connected; t++) {
+    uint8_t type = typesToTry[t];
+    const char* typeName;
+    switch (type) {
+      case 0:   typeName = "PUBLIC(0)";      break;
+      case 1:   typeName = "RANDOM(1)";      break;
+      case 2:   typeName = "PUBLIC_ID(2)";   break;
+      case 3:   typeName = "RANDOM_ID(3)";   break;
+      case 0xFF: typeName = "AUTO(0xFF)";    break;
+      default:  typeName = "UNKNOWN";        break;
+    }
+    Serial.print(F("[CONN] Trying type="));
+    Serial.print(typeName);
+    Serial.print(F("..."));
+
+    BLEAddress address(slot->macAddress, (type == 0xFF) ? 0 : type);
+    if (slot->client->connect(address, type, 5000)) {
+      Serial.println(F(" OK"));
+      connected = true;
+    } else {
+      Serial.println(F(" FAILED"));
+    }
+  }
+
+  if (!connected) {
+    Serial.println(F("[CONN] All address types exhausted"));
+    delete slot->client;
+    slot->client = nullptr;
+    delete slot->clientCallbacks;
+    slot->clientCallbacks = nullptr;
+    return false;
+  }
+
+  // Clear discovered address type after successful connection
+  foundAddrType = -1;
   
-  Serial.println(" OK");
-  
-  NimBLERemoteService* svc = slot->client->getService("180D");
+  BLERemoteService* svc = slot->client->getService(BLEUUID("180D"));
   if (!svc) {
     Serial.println("  Service 180D not found, disconnecting");
     slot->client->disconnect();
+    delete slot->client;
+    slot->client = nullptr;
+    delete slot->clientCallbacks;
+    slot->clientCallbacks = nullptr;
     return false;
   }
   
-  NimBLERemoteCharacteristic* chr = svc->getCharacteristic("2A37");
+  BLERemoteCharacteristic* chr = svc->getCharacteristic(BLEUUID("2A37"));
   if (!chr || !chr->canNotify()) {
     Serial.println("  Characteristic 2A37 not found or no notify, disconnecting");
     slot->client->disconnect();
+    delete slot->client;
+    slot->client = nullptr;
+    delete slot->clientCallbacks;
+    slot->clientCallbacks = nullptr;
     return false;
   }
   
-  chr->subscribe(true, hrNotificationCallback);
+  chr->registerForNotify(hrNotificationCallback);
   slot->hrCharacteristic = chr;
   slot->isConnected = true;
   
@@ -433,6 +442,7 @@ void handleSerialInput() {
       Serial.println(F("===espHrHub Help==="));
       Serial.println(F("S/s - Scan for sensors"));
       Serial.println(F("1-4 - Select sensor slot 1-4"));
+      Serial.println(F("c/C - Force reconnect slot 0"));
       Serial.println(F("?   - Show this help"));
     }
     else {
@@ -471,80 +481,94 @@ void checkSensorReconnections() {
 
 // ── BLE Setup Functions ────────────────────────────────────────────────────
 void setupBLE() {
-   NimBLEDevice::init("espHRhub");
+  BLEDevice::init("espHRhub");
   
-  pPeripheralServer = NimBLEDevice::createServer();
+  pPeripheralServer = BLEDevice::createServer();
   pPeripheralServer->setCallbacks(new ServerCallbacks());
   
-  NimBLEService* hrService = pPeripheralServer->createService("180D");
+  BLEService* hrService = pPeripheralServer->createService(BLEUUID("180D"));
   pHRSensorCharacteristic = hrService->createCharacteristic(
-      "2A37", 
-    NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY
-    );
-  pHRSensorCharacteristic->setCallbacks(new HRCharacteristicCallbacks());
-  // Add Body Sensor Location characteristic (2A38) for Apple Watch compatibility
-  // Values: 0=Other, 1=chest, 2=wrist, 3=thumb, 4=finger, 5=earlobe, 6=foot
+    BLEUUID("2A37"),
+    BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY
+  );
+  
+  // Add CCCD descriptor for notifications
+  pHRDescriptor2902 = new BLE2902();
+  pHRDescriptor2902->setNotifications(true);
+  pHRSensorCharacteristic->addDescriptor(pHRDescriptor2902);
+  
+  // Add Body Sensor Location characteristic (2A38)
   uint8_t bsl = 2; // wrist
-  hrService->createCharacteristic(
-    "2A38", 
-    NIMBLE_PROPERTY::READ
-  )->setValue(&bsl, 1);
+  BLECharacteristic* bslChar = hrService->createCharacteristic(
+    BLEUUID("2A38"),
+    BLECharacteristic::PROPERTY_READ
+  );
+  bslChar->setValue(&bsl, 1);
+  
   hrService->start();
   
-  pPeripheralAdvertising = NimBLEDevice::getAdvertising();
+  pPeripheralAdvertising = BLEDevice::getAdvertising();
 }
 
 void startAdvertising() {
   if (pPeripheralAdvertising) {
-    pPeripheralAdvertising->addServiceUUID("180D");
-    pPeripheralAdvertising->setAppearance(0x0340);         // Heart Rate Sensor
-    pPeripheralAdvertising->setName("espHRhub");
-    pPeripheralAdvertising->enableScanResponse(true);
+    pPeripheralAdvertising->addServiceUUID(BLEUUID("180D"));
+    pPeripheralAdvertising->setScanResponse(true);
     pPeripheralAdvertising->setMinInterval(32);
     pPeripheralAdvertising->setMaxInterval(80);
-    pPeripheralAdvertising->start();
+    pPeripheralAdvertising->setMinPreferred(0x06);
+    pPeripheralAdvertising->setMaxPreferred(0x12);
+    BLEDevice::startAdvertising();
     Serial.println(F("BLE advertising started as 'espHRhub' (HR sensor)"));
   }
 }
 
 int scanForSensors() {
-   // Reset discovered devices array
-   for (int i = 0; i < MAX_SENSOR_SLOTS; i++) {
-     discoveredDevices[i].name = "";
-     discoveredDevices[i].address = NimBLEAddress((uint8_t[]){0,0,0,0,0,0}, BLE_ADDR_PUBLIC);
-     discoveredDevices[i].rssi = 0;
-   }
-   
-    Serial.println("Scanning for nearby BLE devices...");
-    Serial.print("Scan duration: ");
-    Serial.print(SCAN_DURATION_MS);
-    Serial.println(" ms");
-    Serial.print("Max sensor slots: ");
-    Serial.println(MAX_SENSOR_SLOTS);
+  // Reset discovered devices array
+  for (int i = 0; i < MAX_SENSOR_SLOTS; i++) {
+    discoveredDevices[i].name = "";
+    discoveredDevices[i].address = BLEAddress((uint8_t[]){0,0,0,0,0,0}, 0);
+    discoveredDevices[i].rssi = 0;
+    discoveredDevices[i].hasHRService = false;
+  }
   
-    // Must stop advertising to scan — single BLE radio can't do both
-    if (pPeripheralAdvertising) {
-        pPeripheralAdvertising->stop();
-        delay(100);   // Let advertising fully stop
-    }
+  // Reset discovered address type before each scan
+  foundAddrType = -1;
   
-    NimBLEScan* pScan = NimBLEDevice::getScan();
-    pScan->setScanCallbacks(&scanCallbacks);
-    pScan->start(SCAN_DURATION_MS, false);
+  Serial.println("Scanning for nearby BLE devices...");
+  Serial.print("Scan duration: ");
+  Serial.print(SCAN_DURATION_MS);
+  Serial.println(" ms");
+  Serial.print("Max sensor slots: ");
+  Serial.println(MAX_SENSOR_SLOTS);
   
-   Serial.println("Scan complete.");
-   Serial.print("Found ");
-   int count = discoveredDeviceCount;
-   Serial.print(count);
-   Serial.println(" devices.");
+  // Must stop advertising to scan
+  if (pPeripheralAdvertising) {
+    BLEDevice::stopAdvertising();
+    delay(100);
+  }
   
-   discoveredDeviceCount = 0;
-
-    // Resume advertising after scan
-    startAdvertising();
-
-    // Return number of devices found so caller can auto-connect
-    return count;
+  BLEScan* pScan = BLEDevice::getScan();
+  pScan->setAdvertisedDeviceCallbacks(&scanCallbacks);
+  pScan->setActiveScan(true);
+  pScan->setInterval(100);
+  pScan->setWindow(99);
+  
+  Serial.println(F("[SCAN] Starting BLE discovery..."));
+  pScan->start(SCAN_DURATION_MS / 1000, false);
+  
+  Serial.println("Scan complete.");
+  Serial.print("Found ");
+  int count = discoveredDeviceCount;
+  Serial.print(count);
+  Serial.println(" devices.");
+  
+  discoveredDeviceCount = 0;
+  
+  // Resume advertising
+  startAdvertising();
+  
+  return count;
 }
 
 // ── Setup Function ─────────────────────────────────────────────────────────
@@ -562,6 +586,7 @@ void setup() {
   
   for (int i = 0; i < MAX_SENSOR_SLOTS; i++) {
     sensorSlots[i].client = nullptr;
+    sensorSlots[i].clientCallbacks = nullptr;
     sensorSlots[i].hrCharacteristic = nullptr;
     sensorSlots[i].isConnected = false;
     sensorSlots[i].lastBPM = 70;
@@ -631,46 +656,41 @@ void loop() {
   
   if (buttonScanRequested) {
     buttonScanRequested = false;
-    Serial.println("\n[BOOT button] Scanning for HR sensors...");
+    Serial.println(F("\n[BOOT button] Scanning for HR sensors..."));
     ledMode = LED_MODE_SCANNING;
     int foundCount = scanForSensors();
     
-    // If we found sensors, auto-connect to the first one with HR service (180D)
+    // If we found HR sensors, auto-connect to the first one
     bool connected = false;
     for (int i = 0; i < foundCount; i++) {
-      // Check if this device advertises HR service 180D
-      // We can't check here easily, so just try connecting to all non-empty slots
-      // The scan callback would have stored devices
-      // Actually, let's check the discoveredDevices array for any device
-      if (discoveredDevices[i].address.toString() != "00:00:00:00:00:00") {
-        Serial.print("[BOOT] Found device: ");
+      if (discoveredDevices[i].address.toString() != "00:00:00:00:00:00" && discoveredDevices[i].hasHRService) {
+        Serial.print("[BOOT] Found HR device: ");
         Serial.print(discoveredDevices[i].name.length() > 0 ? discoveredDevices[i].name.c_str() : "(no name)");
         Serial.print(" at MAC ");
-        const uint8_t* m = discoveredDevices[i].address.getVal();
-        for (int j = 0; j < 6; j++) {
-          if (m[j] < 0x10) Serial.print("0");
-          Serial.print(m[j], HEX);
-          if (j < 5) Serial.print(":");
-        }
-        Serial.println();
+        Serial.println(discoveredDevices[i].address.toString().c_str());
         
-        // Store MAC in slot 0
-        memcpy(sensorSlots[0].macAddress, discoveredDevices[i].address.getVal(), 6);
-        Serial.println("[BOOT] Auto-stored in slot 0");
-        
-        if (connectToSensor(0)) {
-          activeSensorIndex = 0;
-          connected = true;
-          Serial.println("[BOOT] Connected to HR sensor!");
-          break;
+        // Only overwrite slot 0 if the configured sensor is not already connected
+        if (!macIsConnected(0)) {
+          const uint8_t* m = discoveredDevices[i].address.getNative();
+          memcpy(sensorSlots[0].macAddress, m, 6);
+          Serial.println("[BOOT] Auto-stored in slot 0");
+          
+          if (connectToSensor(0)) {
+            activeSensorIndex = 0;
+            connected = true;
+            Serial.println("[BOOT] Connected to HR sensor!");
+            break;
+          } else {
+            Serial.println("[BOOT] Failed to connect");
+          }
         } else {
-          Serial.println("[BOOT] Failed to connect");
+          Serial.println("[BOOT] Slot 0 already connected, skipping");
         }
       }
     }
     
     if (!connected) {
-      Serial.println("[BOOT] No HR sensors connected. Will retry via auto-reconnect.");
+      Serial.println("[BOOT] No new HR sensors connected.");
     }
     
     if (activeSensorIndex != -1 && macIsConnected(activeSensorIndex)) {
@@ -678,7 +698,7 @@ void loop() {
     } else {
       ledMode = LED_MODE_OFF;
     }
-   }
+  }
   
   checkSensorReconnections();
   updateLED();

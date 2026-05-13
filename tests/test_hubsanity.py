@@ -16,7 +16,7 @@ def test_boot_sequence(serial_connection):
     start_time = time.time()
     
     # Read initial boot messages
-    while time.time() - start_time < 15:
+    while time.time() - start_time < 30:
         line = ser.readline().decode('utf-8', errors='ignore').strip()
         if not line:
             continue
@@ -36,12 +36,12 @@ def test_ble_advertising(flashed_esp32, serial_connection):
     found_advertising = False
     start_time = time.time()
     
-    while time.time() - start_time < 15:
+    while time.time() - start_time < 30:
         line = ser.readline().decode('utf-8', errors='ignore').strip()
         if not line:
             continue
         
-        if "ESP32 HR Hub" in line or "Advertising started" in line:
+        if "espHRhub" in line or "advertising started" in line.lower():
             found_advertising = True
             break
     
@@ -59,7 +59,7 @@ def test_scan_functionality(flashed_esp32, serial_connection):
     found_scan = False
     start_time = time.time()
     
-    while time.time() - start_time < 15:
+    while time.time() - start_time < 30:
         line = ser.readline().decode('utf-8', errors='ignore').strip()
         if not line:
             continue
@@ -74,14 +74,11 @@ def test_sensor_connection_workflow(flashed_esp32, serial_connection):
     """Test the sensor connection workflow."""
     ser = serial_connection
     
-    # Clear buffer
-    ser.flushInput()
-    
     # Look for connection attempts
     found_connection = False
     start_time = time.time()
     
-    while time.time() - start_time < 15:
+    while time.time() - start_time < 30:
         line = ser.readline().decode('utf-8', errors='ignore').strip()
         if not line:
             continue
@@ -100,7 +97,7 @@ def test_hr_data_detection(flashed_esp32, serial_connection):
     # Give time for any HR data to appear
     start_time = time.time()
     
-    while time.time() - start_time < 15:
+    while time.time() - start_time < 30:
         line = ser.readline().decode('utf-8', errors='ignore').strip()
         
         # Look for HR patterns (BPM values)

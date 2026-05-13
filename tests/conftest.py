@@ -15,8 +15,6 @@ def find_esp32_port():
             return port.device
     return None
 
-SERIAL_PORT = find_esp32_port()
-
 def flash_esp32(port):
     cmd = ["arduino-cli", "upload", "-p", port, "--fqbn", BOARD, SKETCH_DIR, "--upload-property", "upload.speed=115200"]
     try:
@@ -30,15 +28,17 @@ def flash_esp32(port):
         print("Upload timeout")
         return False
 
-@pytest.fixture
-def serial_connection():
-    ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=SERIAL_TIMEOUT)
-    time.sleep(2)
-    ser.flushInput()
-    yield ser
-    ser.close()
+def reset_esp32(ser):
+    """Reset ESP32 via DTR/RTS toggling."""
+    ser.dtr = False
+    ser.rts = True
+    time.sleep(0.1)
+    ser.rts = False
+    time.sleep(0.5)
+    ser.dtr = True
+    time.sleep(0.5)  # Brief wait for boot to start
 
-@pytest.fixture
+@pytest.fixture(scope="session")
 def flashed_esp32():
     port = find_esp32_port()
     if not port:
@@ -51,9 +51,20 @@ def flashed_esp32():
         pytest.fail("Failed to flash ESP32. Check connection and try again.")
 
 @pytest.fixture
+def serial_connection(flashed_esp32):
+    ser = serial.Serial(flashed_esp32, BAUD_RATE, timeout=SERIAL_TIMEOUT)
+    reset_esp32(ser)
+    # Do not flush or read boot messages here — let each test consume them
+    yield ser
+    ser.close()
+
+@pytest.fixture
 def serial_with_timeout():
     def _get_connection(timeout=SERIAL_TIMEOUT):
-        ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=timeout)
+        port = find_esp32_port()
+        if not port:
+            pytest.fail("No ESP32 board detected. Connect the device and retry.")
+        ser = serial.Serial(port, BAUD_RATE, timeout=timeout)
         time.sleep(2)
         ser.flushInput()
         return ser

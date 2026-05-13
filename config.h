@@ -26,11 +26,14 @@
  * MAC Address Storage
  * -------------------
  * Array to store discovered sensor MAC addresses.
- * Format: uint8_t mac[6] where mac[0] is the first byte (LSB).
+ * Format: uint8_t mac[6] where mac[0] is the LSB (little-endian).
+ * For Bluedroid stack (ESP32 Arduino core v3.x), store the MAC in
+ * REVERSE order from the human-readable string:
+ *   Human: 12:70:FE:C3:13:F0 -> Config: {0xF0, 0x13, 0xC3, 0xFE, 0x70, 0x12}
  * Initialize with {0, 0, 0, 0, 0, 0} for empty slots.
  */
 static const uint8_t DISCOVERED_MAC_ADDRESSES[MAX_SENSOR_SLOTS][6] = {
-  {0x12, 0x70, 0xFE, 0xC3, 0x13, 0xF0}, // TICKR FIT 6D01
+  {0xF0, 0x13, 0xC3, 0xFE, 0x70, 0x12}, // TICKR FIT 6D01 (human: 12:70:FE:C3:13:F0)
   {0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, // Slot 1 - default empty
   {0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, // Slot 2 - default empty
   {0x00, 0x00, 0x00, 0x00, 0x00, 0x00}  // Slot 3 - default empty
