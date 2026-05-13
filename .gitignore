@@ -6,4 +6,4 @@
 .env
 
 # ai harness files
-.opencode
+.opencode/**
