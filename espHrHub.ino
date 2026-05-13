@@ -34,6 +34,36 @@ struct SensorSlot {
 
 static SensorSlot sensorSlots[MAX_SENSOR_SLOTS];
 
+// Orphaned BLE clients waiting for safe deletion (avoid use-after-free with Bluedroid)
+static BLEClient* orphanedClients[MAX_SENSOR_SLOTS] = {nullptr};
+static BLEClientCallbacks* orphanedCallbacks[MAX_SENSOR_SLOTS] = {nullptr};
+static unsigned long orphanTime[MAX_SENSOR_SLOTS] = {0};
+
+void scheduleClientOrphan(int slotIndex, BLEClient* client, BLEClientCallbacks* callbacks) {
+  if (orphanedClients[slotIndex] != nullptr) {
+    // If previous orphan is still there, force-delete it (should be safe by now)
+    delete orphanedClients[slotIndex];
+    delete orphanedCallbacks[slotIndex];
+  }
+  orphanedClients[slotIndex] = client;
+  orphanedCallbacks[slotIndex] = callbacks;
+  orphanTime[slotIndex] = millis();
+}
+
+void cleanupOrphanedClients() {
+  for (int i = 0; i < MAX_SENSOR_SLOTS; i++) {
+    if (orphanedClients[i] != nullptr) {
+      // Wait at least 500ms after orphaning to let Bluedroid finish disconnect events
+      if (millis() - orphanTime[i] >= 500 && !orphanedClients[i]->isConnected()) {
+        delete orphanedClients[i];
+        delete orphanedCallbacks[i];
+        orphanedClients[i] = nullptr;
+        orphanedCallbacks[i] = nullptr;
+      }
+    }
+  }
+}
+
 // Current state
 int activeSensorIndex = -1;
 uint8_t lastBPMFromAnySensor = 70;
@@ -62,9 +92,8 @@ bool macIsUnused(const uint8_t* mac) {
 
 bool macIsConnected(int slotIndex) {
   if (slotIndex < 0 || slotIndex >= MAX_SENSOR_SLOTS) return false;
-  return sensorSlots[slotIndex].isConnected && 
-         sensorSlots[slotIndex].client != nullptr &&
-         sensorSlots[slotIndex].client->isConnected();
+  return sensorSlots[slotIndex].isConnected &&
+         sensorSlots[slotIndex].client != nullptr;
 }
 
 // ── BLE Callback Classes ───────────────────────────────────────────────────
@@ -205,6 +234,7 @@ class ClientCallbacks : public BLEClientCallbacks {
     for (int i = 0; i < MAX_SENSOR_SLOTS; i++) {
       if (sensorSlots[i].client == pclient) {
         sensorSlots[i].isConnected = false;
+        sensorSlots[i].hrCharacteristic = nullptr;  // prevent stale pointer use
         break;
       }
     }
@@ -223,20 +253,32 @@ bool connectToSensor(int slotIndex) {
   }
   
   SensorSlot* slot = &sensorSlots[slotIndex];
-  
+
+  // If an old client exists, safely replace it rather than reusing (avoids stale
+  // service cache since clearServices() is private in the Arduino BLE library).
   if (slot->client != nullptr) {
-    if (slot->isConnected && slot->client->isConnected()) {
+    if (slot->client->isConnected()) {
+      if (slot->isConnected && slot->hrCharacteristic != nullptr) {
+        return true;
+      }
+      Serial.println(F("[CONN] Disconnecting stale client..."));
       slot->client->disconnect();
+      slot->isConnected = false;
+      slot->hrCharacteristic = nullptr;
+      return false;
     }
-    delete slot->client;
+    // Disconnected — orphan for deferred cleanup, then create a fresh client
+    scheduleClientOrphan(slotIndex, slot->client, slot->clientCallbacks);
     slot->client = nullptr;
-    slot->hrCharacteristic = nullptr; // Prevent stale pointer use
-    if (slot->clientCallbacks != nullptr) {
-      delete slot->clientCallbacks;
-      slot->clientCallbacks = nullptr;
-    }
+    slot->clientCallbacks = nullptr;
+    slot->hrCharacteristic = nullptr;
+    slot->isConnected = false;
   }
-  
+
+  slot->client = BLEDevice::createClient();
+  slot->clientCallbacks = new ClientCallbacks();
+  slot->client->setClientCallbacks(slot->clientCallbacks);
+
   Serial.print("[CONN] Connecting to slot ");
   Serial.print(slotIndex);
   Serial.print(" MAC: ");
@@ -246,10 +288,6 @@ bool connectToSensor(int slotIndex) {
     if (j < 5) Serial.print(":");
   }
   Serial.println();
-  
-  slot->client = BLEDevice::createClient();
-  slot->clientCallbacks = new ClientCallbacks();
-  slot->client->setClientCallbacks(slot->clientCallbacks);
 
   bool connected = false;
   uint8_t typesToTry[6];
@@ -298,10 +336,8 @@ bool connectToSensor(int slotIndex) {
 
   if (!connected) {
     Serial.println(F("[CONN] All address types exhausted"));
-    delete slot->client;
-    slot->client = nullptr;
-    delete slot->clientCallbacks;
-    slot->clientCallbacks = nullptr;
+    slot->isConnected = false;
+    slot->hrCharacteristic = nullptr;
     return false;
   }
 
@@ -312,21 +348,17 @@ bool connectToSensor(int slotIndex) {
   if (!svc) {
     Serial.println("  Service 180D not found, disconnecting");
     slot->client->disconnect();
-    delete slot->client;
-    slot->client = nullptr;
-    delete slot->clientCallbacks;
-    slot->clientCallbacks = nullptr;
+    slot->isConnected = false;
+    slot->hrCharacteristic = nullptr;
     return false;
   }
-  
+
   BLERemoteCharacteristic* chr = svc->getCharacteristic(BLEUUID("2A37"));
   if (!chr || !chr->canNotify()) {
     Serial.println("  Characteristic 2A37 not found or no notify, disconnecting");
     slot->client->disconnect();
-    delete slot->client;
-    slot->client = nullptr;
-    delete slot->clientCallbacks;
-    slot->clientCallbacks = nullptr;
+    slot->isConnected = false;
+    slot->hrCharacteristic = nullptr;
     return false;
   }
   
@@ -347,8 +379,10 @@ bool disconnectSensor(int slotIndex) {
   SensorSlot* slot = &sensorSlots[slotIndex];
   if (slot->client != nullptr && slot->isConnected) {
     slot->client->disconnect();
+    slot->isConnected = false;
+    slot->hrCharacteristic = nullptr;
   }
-  
+
   return true;
 }
 
@@ -592,9 +626,9 @@ void setup() {
     sensorSlots[i].hrCharacteristic = nullptr;
     sensorSlots[i].isConnected = false;
     sensorSlots[i].lastBPM = 70;
-    
+
     memcpy(sensorSlots[i].macAddress, DISCOVERED_MAC_ADDRESSES[i], 6);
-    
+
     if (!macIsUnused(sensorSlots[i].macAddress)) {
       Serial.print("Configured sensor slot ");
       Serial.print(i);
@@ -606,10 +640,18 @@ void setup() {
       Serial.println();
     }
   }
-  
+
   setupBLE();
   startAdvertising();
-  
+
+  for (int i = 0; i < MAX_SENSOR_SLOTS; i++) {
+    if (!macIsUnused(sensorSlots[i].macAddress)) {
+      sensorSlots[i].client = BLEDevice::createClient();
+      sensorSlots[i].clientCallbacks = new ClientCallbacks();
+      sensorSlots[i].client->setClientCallbacks(sensorSlots[i].clientCallbacks);
+    }
+  }
+
   Serial.println(F("\nConnecting to configured sensors..."));
   bool connectedAny = false;
   for (int i = 0; i < MAX_SENSOR_SLOTS; i++) {
@@ -633,7 +675,7 @@ void setup() {
   if (activeSensorIndex != -1 && macIsConnected(activeSensorIndex)) {
     ledMode = LED_MODE_CONNECTED;
   }
-  
+
   Serial.println(F("\n=== Setup Complete ==="));
   Serial.println(F(""));
   Serial.println(F("Ready. Apple Watch should see 'espHRhub' in HR sensors list."));
@@ -702,8 +744,9 @@ void loop() {
     }
   }
   
+  cleanupOrphanedClients();
   checkSensorReconnections();
   updateLED();
-  
+
   delay(50);
 }
