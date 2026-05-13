@@ -214,6 +214,8 @@ class ClientCallbacks : public BLEClientCallbacks {
 // ── Sensor Connection Functions ─────────────────────────────────────────────
 bool connectToSensor(int slotIndex) {
   if (slotIndex < 0 || slotIndex >= MAX_SENSOR_SLOTS) return false;
+  // Reset stale discovered type from a previous scan so we don't carry it over
+  foundAddrType = -1;
   if (macIsUnused(sensorSlots[slotIndex].macAddress)) {
     Serial.print("Cannot connect: empty MAC at slot ");
     Serial.println(slotIndex);
